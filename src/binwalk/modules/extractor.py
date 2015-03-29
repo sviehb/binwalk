@@ -5,7 +5,6 @@
 import os
 import re
 import sys
-import stat
 import shlex
 import tempfile
 import subprocess
@@ -96,24 +95,6 @@ class Extractor(Module):
         if self.matryoshka:
             self.config.verbose = True
 
-    def add_pending(self, f):
-        # Ignore symlinks
-        if os.path.islink(f):
-            return
-
-        # Get the file mode to check and see if it's a block/char device
-        try:
-            file_mode = os.stat(f).st_mode
-        except OSError as e:
-            return
-
-        # Only add this to the pending list of files to scan
-        # if the file is a regular file or a block/character device.
-        if (stat.S_ISREG(file_mode) or
-            stat.S_ISBLK(file_mode) or
-            stat.S_ISCHR(file_mode)):
-            self.pending.append(f)
-
     def reset(self):
         # Holds a list of pending files that should be scanned; only populated if self.matryoshka == True
         self.pending = []
@@ -122,6 +103,8 @@ class Extractor(Module):
         # Holds a dictionary of the last directory listing for a given directory; used for identifying
         # newly created/extracted files that need to be appended to self.pending.
         self.last_directory_listing = {}
+        # Set to the directory path of the first extracted directory; this allows us to track recursion depth.
+        self.base_recursion_dir = ""
 
     def callback(self, r):
         # Make sure the file attribute is set to a compatible instance of binwalk.core.common.BlockFile
@@ -166,20 +149,21 @@ class Extractor(Module):
                     real_file_path = os.path.realpath(file_path)
                     self.result(description=file_path, display=False)
 
-                    # If recursion was specified, and the file is not the same one we just dd'd
-                    if self.matryoshka and file_path != dd_file_path and scan_extracted_files:
+                    # If recursion was specified, and the file is not the same one we just dd'd, and if it is not a directory/symlink
+                    if self.matryoshka and file_path != dd_file_path and scan_extracted_files and not os.path.islink(file_path):
                         # If the recursion level of this file is less than or equal to our desired recursion level
-                        if len(real_file_path.split(self.directory)[1].split(os.path.sep)) <= self.matryoshka:
+                        if len(real_file_path.split(self.base_recursion_dir)[1].split(os.path.sep)) <= self.matryoshka:
                             # If this is a directory and we are supposed to process directories for this extractor,
                             # then add all files under that directory to the list of pending files.
                             if os.path.isdir(file_path):
                                 for root, dirs, files in os.walk(file_path):
                                     for f in files:
                                         full_path = os.path.join(root, f)
-                                        self.add_pending(full_path)
-                            # If it's just a file, it to the list of pending files
+                                        if not os.path.islink(full_path):
+                                            self.pending.append(full_path)
+                            # If it's just a file, it to eh list of pending files
                             else:
-                                self.add_pending(file_path)
+                                self.pending.append(file_path)
 
                 # Update the last directory listing for the next time we extract a file to this same output directory
                 self.last_directory_listing[extraction_directory] = directory_listing
@@ -333,11 +317,6 @@ class Extractor(Module):
         if not has_key(self.extraction_directories, path):
             basedir = os.path.dirname(path)
             basename = os.path.basename(path)
-
-            # Make sure we put the initial extracted file in the CWD
-            if self.directory is None:
-                basedir = os.getcwd()
-
             outdir = os.path.join(basedir, '_' + basename)
             output_directory = unique_file_name(outdir, extension='extracted')
 
@@ -350,9 +329,9 @@ class Extractor(Module):
             output_directory = self.extraction_directories[path]
 
         # Set the initial base extraction directory for later determining the level of recusion
-        if self.directory is None:
-            self.directory = os.path.realpath(output_directory) + os.path.sep
-
+        # TODO: This is no longer needed since self.directory has the same information. Update code accordingly.
+        if not self.base_recursion_dir:
+            self.base_recursion_dir = os.path.realpath(output_directory) + os.path.sep
 
         return output_directory
 
@@ -390,7 +369,6 @@ class Extractor(Module):
         original_dir = os.getcwd()
         rules = self.match(description)
         file_path = os.path.realpath(file_name)
-        # Don't recurse by default; any successful extraction rule will override this.
         recurse = True
 
         # No extraction rules for this file
@@ -400,6 +378,10 @@ class Extractor(Module):
             binwalk.core.common.debug("Found %d matching extraction rules" % len(rules))
 
         output_directory = self.build_output_directory(file_name)
+
+        # Update self.directory with the first output_directory path
+        if self.directory is None:
+            self.directory = output_directory
 
         # Extract to end of file if no size was specified
         if not size:
